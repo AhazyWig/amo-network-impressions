@@ -4,12 +4,13 @@ import logging
 import os
 import polars as pl
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 GZ_FILE = "NetworkBackfillImpressions.gz"
 BQ_PROJECT = os.getenv("BQ_PROJECT")
 BQ_DATASET = os.getenv("BQ_DATASET")
-BQ_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.network_impressions_fact"
+RAW_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.network_impressions_raw"
+FACT_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.network_impressions_fact"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -35,72 +36,104 @@ def extract_session_id(df: pl.Dataframe):
     )
     return df
 
-def transform_agg(df):
+def transform_raw(df):
     logging.info("Transforming data")
 
     df = df.with_columns(
-        pl.col("Time").str.strptime(pl.Datetime, "%Y-%m-%d-%H:%M:%S", strict=False).alias("event_time"),
-        pl.col("EstimatedBackfillRevenue").cast(pl.Float64)
-    )
-    # Create dt column for partition
+            pl.coalesce(
+                pl.col("CustomTargeting").str.extract(r"(?:^|;)sessionid=([^;]+)"),
+                pl.col("CustomTargeting").str.extract(r"(?:^|;)dfpsessionid=([^;]+)"),
+                pl.lit("unknown")
+            ).alias("session_id"),
+            pl.col("Time").str.strptime(pl.Datetime, "%Y-%m-%d-%H:%M:%S", strict=False).alias("event_time"),
+            pl.col("EstimatedBackfillRevenue").cast(pl.Float64),
+            pl.col("ImpressionId").cast(pl.Utf8)
+        )
+    # Створення dt для партицій
     df = df.with_columns(pl.col("event_time").dt.date().alias("dt"))
+    return df
 
-    agg_df = (
-        df.groupby(["session_id", "Product", "DeviceCategory", "dt"])
-          .agg([
-              pl.sum("EstimatedBackfillRevenue").alias("total_cost"),
-              pl.count("ImpressionId").alias("impression_count")
-          ])
-    )
-    
-    return agg_df
+def upload_raw(df):
+    if df.is_empty():
+        logging.info("No data to upload")
+        return
+    client.load_table_from_dataframe(df.to_pandas(), RAW_TABLE, job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")).result()
+    logging.info(f"Inserted {df.height} rows into RAW table")
 
 
+def merge_fact(days_back):
+    # Для спрощення вважаємо, що запізнілі події могли надійти кілька днів тому
+    # Наприклад, беремо останні 3 дні
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=days_back)
 
-def create_table_if_not_exists():
-    logging.debug(f"Creating table {BQ_TABLE} if not exists")
-    schema = [
-        bigquery.SchemaField("session_id", "STRING"),
-        bigquery.SchemaField("Product", "STRING"),
-        bigquery.SchemaField("DeviceCategory", "STRING"),
-        bigquery.SchemaField("total_cost", "FLOAT"),
-        bigquery.SchemaField("impression_count", "INT64"),
-        bigquery.SchemaField("dt", "DATE"),
-    ]
-    table = bigquery.Table(BQ_TABLE, schema=schema)
+    query = f"""
+    MERGE `{FACT_TABLE}` T
+    USING (
+        SELECT
+            session_id,
+            Product,
+            DeviceCategory,
+            dt,
+            SUM(EstimatedBackfillRevenue) AS total_cost,
+            COUNT(ImpressionId) AS impression_count
+        FROM `{RAW_TABLE}`
+        WHERE dt BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY session_id, Product, DeviceCategory, dt
+    ) S
+    ON T.session_id = S.session_id
+       AND T.Product = S.Product
+       AND T.DeviceCategory = S.DeviceCategory
+       AND T.dt = S.dt
+    WHEN MATCHED THEN
+      UPDATE SET total_cost = S.total_cost, impression_count = S.impression_count
+    WHEN NOT MATCHED THEN
+      INSERT (session_id, Product, DeviceCategory, dt, total_cost, impression_count)
+      VALUES (S.session_id, S.Product, S.DeviceCategory, S.dt, S.total_cost, S.impression_count)
+    """
+    client.query(query).result()
+    logging.info(f"Fact table updated successfully for dates {start_date} and {end_date}")
+
+
+def create_table_if_not_exists(table_name, raw):
+    if raw:
+        schema = [
+            bigquery.SchemaField("session_id", "STRING"),
+            bigquery.SchemaField("Product", "STRING"),
+            bigquery.SchemaField("DeviceCategory", "STRING"),
+            bigquery.SchemaField("event_time", "TIMESTAMP"),
+            bigquery.SchemaField("EstimatedBackfillRevenue", "FLOAT"),
+            bigquery.SchemaField("ImpressionId", "STRING"),
+            bigquery.SchemaField("dt", "DATE"),
+        ]
+    else:
+        schema = [
+            bigquery.SchemaField("session_id", "STRING"),
+            bigquery.SchemaField("Product", "STRING"),
+            bigquery.SchemaField("DeviceCategory", "STRING"),
+            bigquery.SchemaField("dt", "DATE"),
+            bigquery.SchemaField("total_cost", "FLOAT"),
+            bigquery.SchemaField("impression_count", "INT64"),
+        ]
+
+    table = bigquery.Table(table_name, schema=schema)
     table.time_partitioning = bigquery.TimePartitioning(field="dt")
     table.clustering_fields = ["Product", "DeviceCategory"]
     try:
         client.create_table(table, exists_ok=True)
-        logging.info(f"Table {BQ_TABLE} created or already exists.")
+        logging.info(f"Table {table_name} created or already exists.")
     except Exception as e:
-        logging.error(f"Failed to create table {BQ_TABLE}: {e}")
-
-
-def upload_to_bigquery(df):
-    if df.is_empty():
-        logging.info("No data to upload")
-        return
-    
-    pandas_df = df.to_pandas()
-
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_APPEND",
-    )
-
-    try:
-        job = client.load_table_from_dataframe(pandas_df, BQ_TABLE, job_config=job_config)
-        job.result()
-        logging.info(f"Inserted {len(pandas_df)} records into {BQ_TABLE}")
-    except Exception as e:
-        logging.error(f"Error inserting records: {e}")
-
+        logging.error(f"Failed to create table {table_name}: {e}")
+        raise
 
 if __name__ == "__main__":
-    create_table_if_not_exists()
+    create_table_if_not_exists(RAW_TABLE, raw=True)
+    create_table_if_not_exists(FACT_TABLE, raw=False)
     df = read_file(GZ_FILE)
     df = extract_session_id(df)
-    agg_df = transform_agg(df)
-    upload_to_bigquery(agg_df)
-    logging.info("Success")
     
+    transform_raw(df)
+    upload_raw()
+
+    merge_fact(days_back=3)
+    logging.info("Success")
