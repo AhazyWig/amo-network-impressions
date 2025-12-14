@@ -132,8 +132,9 @@ if __name__ == "__main__":
     df = read_file(GZ_FILE)
     df = extract_session_id(df)
     
-    transform_raw(df)
-    upload_raw()
+    df = transform_raw(df)
+    upload_raw(df)
 
     merge_fact(days_back=3)
     logging.info("Success")
+
